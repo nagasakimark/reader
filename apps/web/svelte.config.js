@@ -18,7 +18,11 @@ const config = {
   kit: {
     adapter: adapter({
       fallback: '404.html'
-    })
+    }),
+    paths: {
+      // eslint-disable-next-line no-undef
+      base: process.env.BASE_PATH ?? ''
+    }
   }
 };
 

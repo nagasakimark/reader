@@ -28,8 +28,23 @@
   import { reactiveElements } from './reactive-elements';
   import type { AutoScroller, BookmarkManager, PageManager } from './types';
   import BookReaderPaginated from './book-reader-paginated/book-reader-paginated.svelte';
-  import { enableReaderWakeLock$, enableTapEdgeToFlip$ } from '$lib/data/store';
+  import {
+    dictPopupActivation$,
+    dictPopupEnabled$,
+    enableReaderWakeLock$,
+    enableTapEdgeToFlip$
+  } from '$lib/data/store';
   import { onDestroy } from 'svelte';
+  import PopupDictionary from '$lib/components/popup/PopupDictionary.svelte';
+  import DictionaryImportModal from '$lib/components/popup/DictionaryImportModal.svelte';
+  import { scanTextAtPoint } from '$lib/japanese/dom-text-scanner';
+  import { deinflect } from '$lib/japanese/deinflector';
+  import {
+    findTerms,
+    hasDictionaries,
+    type DictionaryTerm
+  } from '$lib/dictionary/dictionary-database';
+  import { isStringPartiallyJapanese } from '$lib/japanese/japanese-utils';
 
   export let htmlContent: string;
 
@@ -262,6 +277,63 @@
 
     wakeLock = undefined;
   }
+
+  // ---- Built-in dictionary popup ----
+
+  let dictPopupVisible = false;
+  let dictPopupQuery = '';
+  let dictPopupEntries: DictionaryTerm[] = [];
+  let dictPopupAnchorRect: DOMRect | null = null;
+  let dictPopupHasDicts = true;
+  let showImportModal = false;
+
+  let _scanTimer: ReturnType<typeof setTimeout> | null = null;
+
+  onDestroy(() => {
+    if (_scanTimer) clearTimeout(_scanTimer);
+  });
+
+  async function handlePointerMove(e: PointerEvent) {
+    if (!$dictPopupEnabled$) return;
+    if ($dictPopupActivation$ === 'alt' && !e.altKey) return;
+    if (e.pointerType === 'touch') return;
+
+    if (_scanTimer) clearTimeout(_scanTimer);
+    _scanTimer = setTimeout(() => runScan(e.clientX, e.clientY), 80);
+  }
+
+  async function runScan(x: number, y: number) {
+    const scan = scanTextAtPoint(x, y, 32);
+    if (!scan || !isStringPartiallyJapanese(scan.text)) {
+      return;
+    }
+
+    const candidates = deinflect(scan.text.slice(0, 16));
+    const seen = new Set<string>();
+    const allEntries: DictionaryTerm[] = [];
+
+    for (const candidate of candidates) {
+      if (seen.has(candidate.text)) continue;
+      seen.add(candidate.text);
+      const found = await findTerms(candidate.text);
+      allEntries.push(...found);
+    }
+
+    const hasDicts = await hasDictionaries();
+    dictPopupHasDicts = hasDicts;
+
+    if (!hasDicts || allEntries.length > 0) {
+      // Deduplicate by id
+      const byId = new Map<number, DictionaryTerm>();
+      for (const e of allEntries) byId.set(e.id!, e);
+      const deduped = [...byId.values()].sort((a, b) => b.score - a.score).slice(0, 20);
+
+      dictPopupQuery = scan.text.slice(0, deduped[0]?.expression.length ?? 8);
+      dictPopupEntries = deduped;
+      dictPopupAnchorRect = scan.range.getBoundingClientRect();
+      dictPopupVisible = true;
+    }
+  }
 </script>
 
 {#if showBlurMessage}
@@ -275,7 +347,7 @@
     The reader is currently blurred due to an external application (e. g. exstatic)
   </div>
 {/if}
-<div bind:this={$containerEl$} class="{pxReader} py-8">
+<div bind:this={$containerEl$} class="{pxReader} py-8" on:pointermove={handlePointerMove}>
   {#if viewMode === ViewMode.Continuous}
     <BookReaderContinuous
       {htmlContent}
@@ -368,3 +440,26 @@
 {$blurListener$ ?? ''}
 {$reactiveElements$ ?? ''}
 <svelte:document bind:visibilityState />
+
+<PopupDictionary
+  query={dictPopupQuery}
+  entries={dictPopupEntries}
+  hasDictionaries={dictPopupHasDicts}
+  anchorRect={dictPopupAnchorRect}
+  visible={dictPopupVisible}
+  on:close={() => (dictPopupVisible = false)}
+  on:importRequest={() => {
+    dictPopupVisible = false;
+    showImportModal = true;
+  }}
+/>
+
+{#if showImportModal}
+  <DictionaryImportModal
+    on:close={() => (showImportModal = false)}
+    on:imported={() => {
+      dictPopupHasDicts = true;
+      showImportModal = false;
+    }}
+  />
+{/if}

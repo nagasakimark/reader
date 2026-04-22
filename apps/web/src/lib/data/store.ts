@@ -486,6 +486,14 @@ export const database = new DatabaseService(db);
 
 export const domainHintSeen$ = writableBooleanLocalStorageSubject()('domainHintSeen', false);
 
+// ---- Built-in dictionary popup ----
+export const dictPopupEnabled$ = writableBooleanLocalStorageSubject()('dictPopupEnabled', false);
+/** 'hover' = show on mousemove; 'alt' = require holding Alt key */
+export const dictPopupActivation$ = writableStringLocalStorageSubject<'hover' | 'alt'>()(
+  'dictPopupActivation',
+  'alt'
+);
+
 export const booklistSortOptions$ = writableObjectLocalStorageSubject<Record<string, SortOption>>()(
   'booklistSortOptions',
   {

@@ -1,54 +1,68 @@
-name: Deploy
+name: Deploy to GitHub Pages
+
 on:
   push:
     branches:
       - main
-    paths:
-      - apps/web/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
 jobs:
-  build-and-deploy:
-    name: Build and deploy
-    if: >-
-      startsWith(github.event.head_commit.message, 'feat') ||
-      startsWith(github.event.head_commit.message, 'fix') ||
-      startsWith(github.event.head_commit.message, 'perf')
+  build:
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v5
+        uses: pnpm/action-setup@v4
         with:
-          version: 10.33.0
-          run_install: false
+          version: 10
 
       - name: Install Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
-          node-version: 24.15.0
+          node-version: 22
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install
 
-      - name: Postinstall steps
-        run: pnpm svelte-kit sync
+      - name: Sync SvelteKit
+        run: pnpm exec svelte-kit sync
         working-directory: apps/web
 
       - name: Build
         run: pnpm build
         working-directory: apps/web
         env:
-          VITE_GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
-          VITE_ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+          BASE_PATH: /reader
 
-      - name: Deploy
-        uses: cloudflare/pages-action@v1.5.0
+      - name: Add .nojekyll
+        run: touch apps/web/build/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: ${{ secrets.CLOUDFLARE_PROJECT_NAME }}
-          directory: build
-          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
-          workingDirectory: apps/web
+          path: apps/web/build
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

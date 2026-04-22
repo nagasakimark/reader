@@ -16,6 +16,7 @@
   import SettingsDimensionPopover from '$lib/components/settings/settings-dimension-popover.svelte';
   import SettingsFontSelector from '$lib/components/settings/settings-font-selector.svelte';
   import SettingsReadingGoals from '$lib/components/settings/settings-reading-goals.svelte';
+  import DictionaryImportModal from '$lib/components/popup/DictionaryImportModal.svelte';
   import SettingsItemGroup from '$lib/components/settings/settings-item-group.svelte';
   import SettingsStorageSourceList from '$lib/components/settings/settings-storage-source-list.svelte';
   import SettingsUserFontDialog from '$lib/components/settings/settings-user-font-dialog.svelte';
@@ -33,6 +34,8 @@
   import {
     customThemes$,
     database,
+    dictPopupActivation$,
+    dictPopupEnabled$,
     fontFamilyGroupOne$,
     fontFamilyGroupTwo$,
     horizontalCustomReadingPosition$,
@@ -41,6 +44,11 @@
     theme$,
     verticalCustomReadingPosition$
   } from '$lib/data/store';
+  import {
+    listDictionaries,
+    deleteDictionary,
+    type DictionaryTerm
+  } from '$lib/dictionary/dictionary-database';
   import type { TextMarginMode } from '$lib/data/text-margin-mode';
   import { availableThemes as availableThemesMap } from '$lib/data/theme-option';
   import type { VerticalTextOrientation } from '$lib/data/vertical-text-orientation';
@@ -488,6 +496,31 @@
         database.storageSourcesChanged$.next([]);
       });
   }
+
+  // ---- Dictionary settings ----
+  let installedDictionaries: { name: string; title: string; termCount: number }[] = [];
+  let showDictImportModal = false;
+  let deletingDict = '';
+
+  $: if (activeSettings === 'Dictionary' && browser) {
+    refreshDictionaries();
+  }
+
+  async function refreshDictionaries() {
+    installedDictionaries = await listDictionaries();
+  }
+
+  async function handleDeleteDict(name: string) {
+    deletingDict = name;
+    await deleteDictionary(name);
+    deletingDict = '';
+    await refreshDictionaries();
+  }
+
+  const optionsForDictActivation: ToggleOption<'hover' | 'alt'>[] = [
+    { id: 'hover', text: 'Hover' },
+    { id: 'alt', text: 'Alt+Hover' }
+  ];
 </script>
 
 <div class="grid grid-cols-1 items-center sm:grid-cols-2 sm:gap-6 lg:md:gap-8 lg:grid-cols-3">
@@ -916,6 +949,73 @@
         </SettingsItemGroup>
       {/if}
     {/if}
+  {:else if activeSettings === 'Dictionary'}
+    <div class="lg:col-span-3">
+      <SettingsItemGroup
+        title="Enable Popup Dictionary"
+        tooltip="Shows a dictionary popup when hovering over Japanese text in the reader"
+      >
+        <ButtonToggleGroup options={optionsForToggle} bind:selectedOptionId={$dictPopupEnabled$} />
+      </SettingsItemGroup>
+    </div>
+
+    {#if $dictPopupEnabled$}
+      <SettingsItemGroup
+        title="Activation"
+        tooltip="Hover: popup appears on mouse movement. Alt+Hover: hold Alt key while hovering"
+      >
+        <ButtonToggleGroup
+          options={optionsForDictActivation}
+          bind:selectedOptionId={$dictPopupActivation$}
+        />
+      </SettingsItemGroup>
+    {/if}
+
+    <div class="lg:col-span-3">
+      <SettingsItemGroup title="Installed Dictionaries">
+        {#if installedDictionaries.length === 0}
+          <p class="text-sm opacity-60">No dictionaries installed.</p>
+        {:else}
+          <ul class="mt-1 space-y-2">
+            {#each installedDictionaries as dict}
+              <li
+                class="flex items-center justify-between rounded border border-gray-600 px-3 py-2 text-sm"
+              >
+                <div>
+                  <span class="font-medium">{dict.title}</span>
+                  <span class="ml-2 opacity-50 text-xs"
+                    >{dict.termCount.toLocaleString()} terms</span
+                  >
+                </div>
+                <button
+                  class="ml-4 text-xs opacity-60 hover:opacity-100 hover:text-red-400"
+                  on:click={() => handleDeleteDict(dict.name)}
+                  disabled={deletingDict === dict.name}
+                >
+                  {deletingDict === dict.name ? 'Deleting…' : 'Delete'}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        <button
+          class="mt-3 rounded px-4 py-1.5 text-sm font-medium"
+          style="background: #89b4fa; color: #1e1e2e"
+          on:click={() => (showDictImportModal = true)}
+        >
+          Import Dictionary (.zip)
+        </button>
+        <p class="mt-2 text-xs opacity-50">
+          Import any Yomitan-format dictionary. Free JMdict available at
+          <a
+            href="https://github.com/themoeway/jmdict-yomitan/releases"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="underline">github.com/themoeway/jmdict-yomitan</a
+          >.
+        </p>
+      </SettingsItemGroup>
+    </div>
   {:else if activeSettings === 'Data'}
     <SettingsItemGroup title="Persistent storage" tooltip={persistentStorageTooltip}>
       <div class="flex items-center">
@@ -1194,3 +1294,13 @@
     </div>
   {/if}
 </div>
+
+{#if showDictImportModal}
+  <DictionaryImportModal
+    on:close={() => (showDictImportModal = false)}
+    on:imported={async () => {
+      showDictImportModal = false;
+      await refreshDictionaries();
+    }}
+  />
+{/if}
