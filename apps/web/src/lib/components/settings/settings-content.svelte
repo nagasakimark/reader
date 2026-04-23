@@ -517,9 +517,9 @@
     await refreshDictionaries();
   }
 
-  const optionsForDictActivation: ToggleOption<'hover' | 'alt'>[] = [
+  const optionsForDictActivation: ToggleOption<'hover' | 'shift'>[] = [
     { id: 'hover', text: 'Hover' },
-    { id: 'alt', text: 'Alt+Hover' }
+    { id: 'shift', text: 'Shift+Hover' }
   ];
 </script>
 

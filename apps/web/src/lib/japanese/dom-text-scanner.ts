@@ -4,11 +4,18 @@
  * All rights reserved.
  */
 
-import { isCodePointJapanese } from './japanese-utils';
-
-/** Tags whose entire subtree should be skipped */
-const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'HEAD', 'NOSCRIPT', 'TEMPLATE', 'IFRAME']);
-/** Tags that count as a newline / word boundary */
+/** Tags whose entire subtree must be skipped */
+const SKIP_TAGS = new Set([
+  'SCRIPT',
+  'STYLE',
+  'HEAD',
+  'NOSCRIPT',
+  'TEMPLATE',
+  'IFRAME',
+  'RT',
+  'RP'
+]);
+/** Block-level tags that act as paragraph boundaries */
 const BLOCK_TAGS = new Set([
   'P',
   'DIV',
@@ -39,47 +46,47 @@ const BLOCK_TAGS = new Set([
 
 export interface ScanResult {
   text: string;
+  /** Range spanning the scanned characters, for highlight/positioning */
   range: Range;
 }
 
 /**
- * Scan up to `maxLength` characters of text forward from (x, y).
- * Returns the extracted text and the DOM Range it spans, or null if
- * the point doesn't hit any text.
+ * Scan up to `maxLength` visible characters forward from (x, y).
+ * Returns the text and DOM range, or null if no text is found.
  */
 export function scanTextAtPoint(x: number, y: number, maxLength = 32): ScanResult | null {
-  const range = getRangeAtPoint(x, y);
-  if (!range) return null;
+  const caretRange = getCaretRange(x, y);
+  if (!caretRange) return null;
 
-  const { node, offset } = getStartPosition(range);
-  if (!node) return null;
+  const startNode = resolveTextNode(caretRange);
+  if (!startNode) return null;
 
-  const result = walkForward(node, offset, maxLength);
-  if (!result.text) return null;
+  const startOffset = caretRange.startContainer === startNode ? caretRange.startOffset : 0;
+
+  const { text, endNode, endOffset } = collectForward(startNode, startOffset, maxLength);
+  if (!text) return null;
 
   const outRange = document.createRange();
-  outRange.setStart(result.startNode, result.startOffset);
-  outRange.setEnd(result.endNode, result.endOffset);
+  outRange.setStart(startNode, startOffset);
+  outRange.setEnd(endNode, endOffset);
 
-  return { text: result.text, range: outRange };
+  return { text, range: outRange };
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-function getRangeAtPoint(x: number, y: number): Range | null {
-  // Standard (Chrome/Edge/Safari)
+function getCaretRange(x: number, y: number): Range | null {
   if (typeof document.caretRangeFromPoint === 'function') {
     return document.caretRangeFromPoint(x, y);
   }
   // Firefox
-  if ('caretPositionFromPoint' in document) {
-    const pos = (
-      document as Document & {
-        caretPositionFromPoint(x: number, y: number): { offsetNode: Node; offset: number } | null;
-      }
-    ).caretPositionFromPoint(x, y);
+  const doc = document as Document & {
+    caretPositionFromPoint?(x: number, y: number): { offsetNode: Node; offset: number } | null;
+  };
+  if (typeof doc.caretPositionFromPoint === 'function') {
+    const pos = doc.caretPositionFromPoint(x, y);
     if (!pos) return null;
     const r = document.createRange();
     r.setStart(pos.offsetNode, pos.offset);
@@ -89,136 +96,166 @@ function getRangeAtPoint(x: number, y: number): Range | null {
   return null;
 }
 
-function getStartPosition(range: Range): { node: Node | null; offset: number } {
-  let node: Node | null = range.startContainer;
-  let offset = range.startOffset;
+/**
+ * Resolve the text node at the caret position, handling ruby elements and
+ * element containers (caretRangeFromPoint sometimes returns an element node).
+ */
+function resolveTextNode(range: Range): Node | null {
+  const node: Node | null = range.startContainer;
 
-  // If we landed inside a <ruby>, move to start of the ruby's base text
-  while (node && node.nodeType !== Node.TEXT_NODE) {
+  if (node.nodeType === Node.TEXT_NODE) return node;
+
+  if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node as Element;
-    if (el.tagName === 'RT' || el.tagName === 'RP') {
-      // Move up to <ruby> element and use first text child
+    const tag = el.tagName.toUpperCase();
+
+    // Inside <rt> / <rp> — move to the ruby base text
+    if (tag === 'RT' || tag === 'RP') {
       const ruby = el.closest('ruby');
-      if (ruby) {
-        node = firstTextDescendant(ruby);
-        offset = 0;
-      } else {
-        return { node: null, offset: 0 };
-      }
-      break;
+      return ruby ? firstTextDescendant(ruby) : null;
     }
-    // Drill into first child
-    if (node.firstChild) {
-      node = node.firstChild;
-      offset = 0;
-    } else {
-      break;
+
+    // caretRangeFromPoint sometimes gives element + child index
+    const child = el.childNodes[range.startOffset];
+    if (child) {
+      if (child.nodeType === Node.TEXT_NODE) return child;
+      return firstTextDescendant(child);
     }
+    return firstTextDescendant(el);
   }
-  return { node, offset };
+
+  return null;
 }
 
-interface WalkResult {
+interface CollectResult {
   text: string;
-  startNode: Node;
-  startOffset: number;
   endNode: Node;
   endOffset: number;
 }
 
-function walkForward(startNode: Node, startOffset: number, maxLength: number): WalkResult {
+/**
+ * Walk the DOM forward from startNode/startOffset collecting characters.
+ * Stops at block boundaries (after collecting something) or maxLength chars.
+ */
+function collectForward(startNode: Node, startOffset: number, maxLength: number): CollectResult {
   let text = '';
-  let endNode = startNode;
+  let endNode: Node = startNode;
   let endOffset = startOffset;
-  const startN = startNode;
-  const startOff = startOffset;
-  let hitJapanese = false;
 
-  // TreeWalker over text nodes from root
-  const walker = document.createTreeWalker(
-    document.body ?? document.documentElement,
-    NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
-    {
-      acceptNode(node) {
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          const el = node as Element;
-          const tag = el.tagName.toUpperCase();
-          if (SKIP_TAGS.has(tag)) return NodeFilter.FILTER_REJECT;
-          if (el.tagName === 'RT' || el.tagName === 'RP') return NodeFilter.FILTER_REJECT;
-          // Check visibility
-          const style = getComputedStyle(el);
-          if (style.display === 'none' || style.visibility === 'hidden') {
-            return NodeFilter.FILTER_REJECT;
-          }
-          return NodeFilter.FILTER_SKIP;
-        }
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    }
-  );
-
-  // Seek walker to startNode
-  let current: Node | null = walker.nextNode();
-  while (current && current !== startNode) {
-    current = walker.nextNode();
-  }
-
-  if (!current) {
-    return { text, startNode: startN, startOffset: startOff, endNode: startN, endOffset: startOff };
-  }
-
-  // Process starting node from offset
+  let currentNode: Node | null = startNode;
   let charOffset = startOffset;
-  while (current && text.length < maxLength) {
-    if (current.nodeType === Node.TEXT_NODE) {
-      const content = current.nodeValue ?? '';
-      for (let i = charOffset; i < content.length && text.length < maxLength; i++) {
-        const cp = content.codePointAt(i)!;
-        const ch = content[i];
 
-        // Stop at newline
-        if (ch === '\n') {
-          if (hitJapanese)
-            goto_end: {
-              endNode = current;
-              endOffset = i;
-              break goto_end;
-            }
+  while (currentNode && text.length < maxLength) {
+    if (currentNode.nodeType === Node.TEXT_NODE) {
+      const content = currentNode.nodeValue ?? '';
+      for (let i = charOffset; i < content.length && text.length < maxLength; i++) {
+        const ch = content[i];
+        const cp = content.codePointAt(i) ?? 0;
+
+        // Paragraph boundary
+        if (ch === '\n' || ch === '\r') {
+          if (text.length > 0) {
+            // record end at this newline position and stop
+            endNode = currentNode;
+            endOffset = i;
+            return { text, endNode, endOffset };
+          }
           break;
         }
 
-        // Skip zero-width and control characters
+        // Skip zero-width / soft-hyphen / control chars
         if (cp === 0x200b || cp === 0x00ad || cp < 0x20) continue;
 
         text += ch;
-        endNode = current;
+        endNode = currentNode;
         endOffset = i + 1;
 
-        if (!hitJapanese && isCodePointJapanese(cp)) {
-          hitJapanese = true;
-        }
-
-        // For surrogate pairs
-        if (cp > 0xffff) i++;
+        if (cp > 0xffff) i++; // skip low surrogate
       }
       charOffset = 0;
-    } else if (current.nodeType === Node.ELEMENT_NODE) {
-      const el = current as Element;
-      if (BLOCK_TAGS.has(el.tagName.toUpperCase())) {
-        if (text.length > 0) break; // stop at block boundary after collecting something
+    } else if (currentNode.nodeType === Node.ELEMENT_NODE) {
+      const el = currentNode as Element;
+      if (text.length > 0 && BLOCK_TAGS.has(el.tagName.toUpperCase())) {
+        // Hit a block boundary after collecting text — stop
+        return { text, endNode, endOffset };
       }
     }
-    current = walker.nextNode();
+
+    currentNode = nextDomNode(currentNode);
   }
 
-  return { text, startNode: startN, startOffset: startOff, endNode, endOffset };
+  return { text, endNode, endOffset };
+}
+
+/**
+ * Return the next node in document order, skipping rejected subtrees.
+ * Text nodes: go to siblings / parents.
+ * Element nodes: enter children first (unless subtree rejected).
+ */
+function nextDomNode(node: Node): Node | null {
+  // Enter element children (if not a rejected subtree)
+  if (
+    node.nodeType === Node.ELEMENT_NODE &&
+    !shouldRejectSubtree(node as Element) &&
+    node.firstChild
+  ) {
+    return node.firstChild;
+  }
+
+  // Walk up until we find a next sibling
+  let current: Node | null = node;
+  while (current) {
+    if (current === document.body || current === document.documentElement) return null;
+    const sibling = current.nextSibling;
+    if (sibling) return sibling;
+    current = current.parentNode;
+  }
+  return null;
+}
+
+function shouldRejectSubtree(el: Element): boolean {
+  if (SKIP_TAGS.has(el.tagName.toUpperCase())) return true;
+  try {
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return true;
+    if (style.opacity === '0') return true;
+  } catch {
+    // ignore
+  }
+  return false;
 }
 
 function firstTextDescendant(node: Node): Node | null {
   if (node.nodeType === Node.TEXT_NODE) return node;
   for (const child of node.childNodes) {
+    if (node.nodeType === Node.ELEMENT_NODE && shouldRejectSubtree(node as Element)) continue;
     const found = firstTextDescendant(child);
     if (found) return found;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// CSS Custom Highlight API helpers (no DOM mutation needed)
+// ---------------------------------------------------------------------------
+
+const HIGHLIGHT_NAME = 'dict-scan';
+
+export function applyWordHighlight(range: Range): void {
+  clearWordHighlight();
+  if (typeof CSS === 'undefined' || !('highlights' in CSS)) return;
+  try {
+    (CSS as any).highlights.set(HIGHLIGHT_NAME, new (window as any).Highlight(range));
+  } catch {
+    // not supported in this browser
+  }
+}
+
+export function clearWordHighlight(): void {
+  if (typeof CSS === 'undefined' || !('highlights' in CSS)) return;
+  try {
+    (CSS as any).highlights.delete(HIGHLIGHT_NAME);
+  } catch {
+    // ignore
+  }
 }

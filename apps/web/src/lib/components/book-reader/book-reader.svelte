@@ -37,7 +37,11 @@
   import { onDestroy } from 'svelte';
   import PopupDictionary from '$lib/components/popup/PopupDictionary.svelte';
   import DictionaryImportModal from '$lib/components/popup/DictionaryImportModal.svelte';
-  import { scanTextAtPoint } from '$lib/japanese/dom-text-scanner';
+  import {
+    scanTextAtPoint,
+    applyWordHighlight,
+    clearWordHighlight
+  } from '$lib/japanese/dom-text-scanner';
   import { deinflect } from '$lib/japanese/deinflector';
   import {
     findTerms,
@@ -295,7 +299,14 @@
 
   async function handlePointerMove(e: PointerEvent) {
     if (!$dictPopupEnabled$) return;
-    if ($dictPopupActivation$ === 'alt' && !e.altKey) return;
+    if ($dictPopupActivation$ === 'shift' && !e.shiftKey) {
+      // Shift released — close popup and clear highlight
+      if (dictPopupVisible) {
+        dictPopupVisible = false;
+        clearWordHighlight();
+      }
+      return;
+    }
     if (e.pointerType === 'touch') return;
 
     if (_scanTimer) clearTimeout(_scanTimer);
@@ -305,6 +316,11 @@
   async function runScan(x: number, y: number) {
     const scan = scanTextAtPoint(x, y, 32);
     if (!scan || !isStringPartiallyJapanese(scan.text)) {
+      // Mouse moved to non-Japanese area — clear previous popup/highlight
+      if (dictPopupVisible) {
+        dictPopupVisible = false;
+        clearWordHighlight();
+      }
       return;
     }
 
@@ -328,10 +344,14 @@
       for (const e of allEntries) byId.set(e.id!, e);
       const deduped = [...byId.values()].sort((a, b) => b.score - a.score).slice(0, 20);
 
-      dictPopupQuery = scan.text.slice(0, deduped[0]?.expression.length ?? 8);
+      const wordLen = deduped[0]?.expression.length ?? Math.min(8, scan.text.length);
+      dictPopupQuery = scan.text.slice(0, wordLen);
       dictPopupEntries = deduped;
       dictPopupAnchorRect = scan.range.getBoundingClientRect();
       dictPopupVisible = true;
+
+      // Highlight the scanned word in the text
+      applyWordHighlight(scan.range);
     }
   }
 </script>
@@ -447,7 +467,10 @@
   hasDictionaries={dictPopupHasDicts}
   anchorRect={dictPopupAnchorRect}
   visible={dictPopupVisible}
-  on:close={() => (dictPopupVisible = false)}
+  on:close={() => {
+    dictPopupVisible = false;
+    clearWordHighlight();
+  }}
   on:importRequest={() => {
     dictPopupVisible = false;
     showImportModal = true;
@@ -463,3 +486,10 @@
     }}
   />
 {/if}
+
+<style>
+  /* CSS Custom Highlight API: highlights the scanned word in the reader text */
+  :global(::highlight(dict-scan)) {
+    background-color: rgba(255, 195, 0, 0.4);
+  }
+</style>

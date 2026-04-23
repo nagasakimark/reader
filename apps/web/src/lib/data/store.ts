@@ -488,10 +488,10 @@ export const domainHintSeen$ = writableBooleanLocalStorageSubject()('domainHintS
 
 // ---- Built-in dictionary popup ----
 export const dictPopupEnabled$ = writableBooleanLocalStorageSubject()('dictPopupEnabled', false);
-/** 'hover' = show on mousemove; 'alt' = require holding Alt key */
-export const dictPopupActivation$ = writableStringLocalStorageSubject<'hover' | 'alt'>()(
+/** 'hover' = show on mousemove; 'shift' = require holding Shift key */
+export const dictPopupActivation$ = writableStringLocalStorageSubject<'hover' | 'shift'>()(
   'dictPopupActivation',
-  'alt'
+  'shift'
 );
 
 export const booklistSortOptions$ = writableObjectLocalStorageSubject<Record<string, SortOption>>()(

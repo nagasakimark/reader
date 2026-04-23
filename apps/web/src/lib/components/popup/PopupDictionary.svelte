@@ -34,22 +34,18 @@
     const vw = window.innerWidth;
     const vh = window.innerHeight;
 
-    // Try to appear below the anchor; fall back to above
-    let t = rect.bottom + MARGIN + window.scrollY;
-    let l = rect.left + window.scrollX;
+    // Use viewport-relative coords (position: fixed)
+    let t = rect.bottom + MARGIN;
+    let l = rect.left;
 
-    // Clamp horizontally
-    if (l + POPUP_WIDTH > vw + window.scrollX - MARGIN) {
-      l = vw + window.scrollX - POPUP_WIDTH - MARGIN;
-    }
+    // Clamp horizontally within viewport
+    if (l + POPUP_WIDTH > vw - MARGIN) l = vw - POPUP_WIDTH - MARGIN;
     if (l < MARGIN) l = MARGIN;
 
     // If not enough room below, flip above
-    if (rect.bottom + POPUP_MAX_HEIGHT + MARGIN > vh) {
-      t = rect.top + window.scrollY - POPUP_MAX_HEIGHT - MARGIN;
-      if (t < window.scrollY + MARGIN) {
-        t = window.scrollY + MARGIN;
-      }
+    if (t + POPUP_MAX_HEIGHT > vh - MARGIN) {
+      t = rect.top - POPUP_MAX_HEIGHT - MARGIN;
+      if (t < MARGIN) t = MARGIN;
     }
 
     left = l;
@@ -130,7 +126,7 @@
 
 <style>
   .dict-popup {
-    position: absolute;
+    position: fixed;
     z-index: 9999;
     width: 340px;
     max-height: 380px;
