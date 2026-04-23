@@ -46,6 +46,7 @@ jobs:
         working-directory: apps/web
         env:
           BASE_PATH: /reader
+          VITE_PAGE_PATH: /reader
 
       - name: Add .nojekyll
         run: touch apps/web/build/.nojekyll
