@@ -491,7 +491,7 @@ export const dictPopupEnabled$ = writableBooleanLocalStorageSubject()('dictPopup
 /** 'hover' = show on mousemove; 'shift' = require holding Shift key */
 export const dictPopupActivation$ = writableStringLocalStorageSubject<'hover' | 'shift'>()(
   'dictPopupActivation',
-  'shift'
+  'hover'
 );
 
 export const booklistSortOptions$ = writableObjectLocalStorageSubject<Record<string, SortOption>>()(

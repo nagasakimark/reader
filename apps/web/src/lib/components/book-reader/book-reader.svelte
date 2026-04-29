@@ -152,6 +152,8 @@
 
   const containerEl$ = writableSubject<HTMLElement | null>(null);
 
+  let _scanTimer: ReturnType<typeof setTimeout> | null = null;
+
   $: heightModifer =
     firstDimensionMargin && ViewMode.Paginated === viewMode && !verticalMode
       ? firstDimensionMargin * 2
@@ -165,6 +167,8 @@
     mutationObserver.disconnect();
 
     releaseWakeLock();
+    if (_scanTimer) clearTimeout(_scanTimer);
+    detachViewportListenersForHighlight?.();
   });
 
   const computedStyle$ = combineLatest([
@@ -291,20 +295,58 @@
   let dictPopupHasDicts = true;
   let showImportModal = false;
 
-  let _scanTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Viewport rects for highlight underlay (CSS Highlight is not universal) */
+  let dictHighlightRects: { left: number; top: number; width: number; height: number }[] = [];
+  let dictHighlightRangeRef: Range | null = null;
 
-  onDestroy(() => {
-    if (_scanTimer) clearTimeout(_scanTimer);
-  });
+  /** Keep highlight aligned when any scroll container moves (continuous window scroll or paginated overflow) */
+  let detachViewportListenersForHighlight: (() => void) | null = null;
+
+  function attachViewportListenersForHighlight() {
+    detachViewportListenersForHighlight?.();
+    const fn = () => refreshHighlightRects();
+    document.addEventListener('scroll', fn, true);
+    window.addEventListener('resize', fn);
+    detachViewportListenersForHighlight = () => {
+      document.removeEventListener('scroll', fn, true);
+      window.removeEventListener('resize', fn);
+      detachViewportListenersForHighlight = null;
+    };
+  }
+
+  function refreshHighlightRects() {
+    if (!dictHighlightRangeRef) {
+      dictHighlightRects = [];
+      return;
+    }
+    try {
+      dictHighlightRects = Array.from(dictHighlightRangeRef.getClientRects())
+        .filter((r) => r.width > 0 && r.height > 0)
+        .map((r) => ({ left: r.left, top: r.top, width: r.width, height: r.height }));
+    } catch {
+      dictHighlightRects = [];
+    }
+  }
+
+  function applyDomHighlight(range: Range) {
+    dictHighlightRangeRef = range.cloneRange();
+    refreshHighlightRects();
+    applyWordHighlight(range);
+    attachViewportListenersForHighlight();
+  }
+
+  function clearDomHighlight() {
+    dictHighlightRangeRef = null;
+    dictHighlightRects = [];
+    clearWordHighlight();
+    detachViewportListenersForHighlight?.();
+  }
 
   async function handlePointerMove(e: PointerEvent) {
     if (!$dictPopupEnabled$) return;
     if ($dictPopupActivation$ === 'shift' && !e.shiftKey) {
-      // Shift released — close popup and clear highlight
-      if (dictPopupVisible) {
-        dictPopupVisible = false;
-        clearWordHighlight();
-      }
+      if (dictPopupVisible) dictPopupVisible = false;
+      clearDomHighlight();
       return;
     }
     if (e.pointerType === 'touch') return;
@@ -316,11 +358,8 @@
   async function runScan(x: number, y: number) {
     const scan = scanTextAtPoint(x, y, 32);
     if (!scan || !isStringPartiallyJapanese(scan.text)) {
-      // Mouse moved to non-Japanese area — clear previous popup/highlight
-      if (dictPopupVisible) {
-        dictPopupVisible = false;
-        clearWordHighlight();
-      }
+      if (dictPopupVisible) dictPopupVisible = false;
+      clearDomHighlight();
       return;
     }
 
@@ -338,21 +377,21 @@
     const hasDicts = await hasDictionaries();
     dictPopupHasDicts = hasDicts;
 
-    if (!hasDicts || allEntries.length > 0) {
-      // Deduplicate by id
-      const byId = new Map<number, DictionaryTerm>();
-      for (const e of allEntries) byId.set(e.id!, e);
-      const deduped = [...byId.values()].sort((a, b) => b.score - a.score).slice(0, 20);
+    const byId = new Map<number, DictionaryTerm>();
+    for (const ent of allEntries) byId.set(ent.id!, ent);
+    const deduped = [...byId.values()].sort((a, b) => b.score - a.score).slice(0, 20);
 
-      const wordLen = deduped[0]?.expression.length ?? Math.min(8, scan.text.length);
-      dictPopupQuery = scan.text.slice(0, wordLen);
-      dictPopupEntries = deduped;
-      dictPopupAnchorRect = scan.range.getBoundingClientRect();
-      dictPopupVisible = true;
+    const wordLen = deduped[0]?.expression.length ?? Math.min(16, scan.text.length);
+    dictPopupQuery = scan.text.slice(0, wordLen);
+    dictPopupEntries = deduped;
+    dictPopupAnchorRect = scan.range.getBoundingClientRect();
+    dictPopupVisible = true;
+    applyDomHighlight(scan.range);
+  }
 
-      // Highlight the scanned word in the text
-      applyWordHighlight(scan.range);
-    }
+  $: if (!$dictPopupEnabled$) {
+    dictPopupVisible = false;
+    clearDomHighlight();
   }
 </script>
 
@@ -367,7 +406,7 @@
     The reader is currently blurred due to an external application (e. g. exstatic)
   </div>
 {/if}
-<div bind:this={$containerEl$} class="{pxReader} py-8" on:pointermove={handlePointerMove}>
+<div bind:this={$containerEl$} class="{pxReader} py-8">
   {#if viewMode === ViewMode.Continuous}
     <BookReaderContinuous
       {htmlContent}
@@ -461,6 +500,19 @@
 {$reactiveElements$ ?? ''}
 <svelte:document bind:visibilityState />
 
+<svelte:window on:pointermove|capture={handlePointerMove} />
+
+{#each dictHighlightRects as r}
+  <div
+    class="pointer-events-none fixed z-[9998] rounded-[1px] bg-amber-400/45"
+    aria-hidden="true"
+    style:left="{r.left}px"
+    style:top="{r.top}px"
+    style:width="{r.width}px"
+    style:height="{r.height}px"
+  />
+{/each}
+
 <PopupDictionary
   query={dictPopupQuery}
   entries={dictPopupEntries}
@@ -469,10 +521,11 @@
   visible={dictPopupVisible}
   on:close={() => {
     dictPopupVisible = false;
-    clearWordHighlight();
+    clearDomHighlight();
   }}
   on:importRequest={() => {
     dictPopupVisible = false;
+    clearDomHighlight();
     showImportModal = true;
   }}
 />
