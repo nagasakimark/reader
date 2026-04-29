@@ -40,7 +40,9 @@
   import {
     scanTextAtPoint,
     applyWordHighlight,
-    clearWordHighlight
+    clearWordHighlight,
+    unionClientRects,
+    rangeHasVerticalWritingMode
   } from '$lib/japanese/dom-text-scanner';
   import { deinflect } from '$lib/japanese/deinflector';
   import {
@@ -320,9 +322,19 @@
       return;
     }
     try {
-      dictHighlightRects = Array.from(dictHighlightRangeRef.getClientRects())
-        .filter((r) => r.width > 0 && r.height > 0)
-        .map((r) => ({ left: r.left, top: r.top, width: r.width, height: r.height }));
+      const raw = Array.from(dictHighlightRangeRef.getClientRects()).filter(
+        (r) => r.width > 0 && r.height > 0
+      );
+      const merged =
+        verticalMode || rangeHasVerticalWritingMode(dictHighlightRangeRef)
+          ? unionClientRects(raw)
+          : raw;
+      dictHighlightRects = merged.map((r) => ({
+        left: r.left,
+        top: r.top,
+        width: r.width,
+        height: r.height
+      }));
     } catch {
       dictHighlightRects = [];
     }
@@ -356,7 +368,7 @@
   }
 
   async function runScan(x: number, y: number) {
-    const scan = scanTextAtPoint(x, y, 32);
+    const scan = scanTextAtPoint(x, y);
     if (!scan || !isStringPartiallyJapanese(scan.text)) {
       if (dictPopupVisible) dictPopupVisible = false;
       clearDomHighlight();

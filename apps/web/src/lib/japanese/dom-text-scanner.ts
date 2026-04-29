@@ -4,7 +4,6 @@
  * All rights reserved.
  */
 
-/** Tags whose entire subtree must be skipped */
 const SKIP_TAGS = new Set([
   'SCRIPT',
   'STYLE',
@@ -15,7 +14,7 @@ const SKIP_TAGS = new Set([
   'RT',
   'RP'
 ]);
-/** Block-level tags that act as paragraph boundaries */
+
 const BLOCK_TAGS = new Set([
   'P',
   'DIV',
@@ -44,41 +43,317 @@ const BLOCK_TAGS = new Set([
   'FIGCAPTION'
 ]);
 
+const WORD_BOUNDARY_TEST = /[^\w\p{L}\p{N}]/u;
+
 export interface ScanResult {
   text: string;
-  /** Range spanning the scanned characters, for highlight/positioning */
   range: Range;
 }
 
-/**
- * Scan up to `maxLength` visible characters forward from (x, y).
- * Returns the text and DOM range, or null if no text is found.
- */
-export function scanTextAtPoint(x: number, y: number, maxLength = 32): ScanResult | null {
+interface CharHit {
+  node: Text;
+  startUtf16: number;
+  units: number;
+}
+
+export function scanTextAtPoint(x: number, y: number, maxSpanUtf16 = 64): ScanResult | null {
   let caretRange = getCaretRange(x, y);
-  if (!caretRange) {
-    caretRange = fallbackCaretRangeFromPoint(x, y);
-  }
+  if (!caretRange) caretRange = fallbackCaretRangeFromPoint(x, y);
   if (!caretRange) return null;
 
-  const startNode = resolveTextNode(caretRange);
-  if (!startNode) return null;
+  const textNode = resolveTextNode(caretRange);
+  if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return null;
 
-  const startOffset = caretRange.startContainer === startNode ? caretRange.startOffset : 0;
+  const tn = textNode as Text;
+  const caretUtf16 =
+    caretRange.startContainer === tn
+      ? caretRange.startOffset
+      : Math.min(tn.nodeValue?.length ?? 0, caretRange.startOffset);
 
-  const { text, endNode, endOffset } = collectForward(startNode, startOffset, maxLength);
-  if (!text) return null;
+  const backwardMax = Math.floor(maxSpanUtf16 / 2);
+  const forwardMax = maxSpanUtf16 - backwardMax;
 
-  const outRange = document.createRange();
-  outRange.setStart(startNode, startOffset);
-  outRange.setEnd(endNode, endOffset);
+  const leftHits = collectBackwardHits(tn, caretUtf16, backwardMax);
+  const rightHits = collectForwardHits(tn, caretUtf16, forwardMax);
 
-  return { text, range: outRange };
+  const hits = [...leftHits, ...rightHits];
+  if (!hits.length) return null;
+
+  const combined = hits
+    .map((h) => readUnits(h.node.nodeValue ?? '', h.startUtf16, h.units))
+    .join('');
+  const caretCombinedUtf16 = utfLenHits(leftHits);
+
+  const slice = clipWordSegmentUtf16(combined, caretCombinedUtf16);
+  if (!slice || slice.end <= slice.start) return null;
+
+  const range = utf16SliceToDomRange(hits, slice.start, slice.end);
+  if (!range) return null;
+
+  return { text: combined.slice(slice.start, slice.end), range };
+}
+
+/** Merge rects — improves vertical-writing overlay alignment */
+export function unionClientRects(rects: DOMRect[]): DOMRect[] {
+  const valid = rects.filter((r) => r.width > 0 && r.height > 0);
+  if (valid.length <= 1) return valid;
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  for (const r of valid) {
+    left = Math.min(left, r.left);
+    top = Math.min(top, r.top);
+    right = Math.max(right, r.right);
+    bottom = Math.max(bottom, r.bottom);
+  }
+  return [new DOMRect(left, top, right - left, bottom - top)];
+}
+
+export function rangeHasVerticalWritingMode(range: Range): boolean {
+  let el: Element | null =
+    range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+      ? (range.commonAncestorContainer as Element)
+      : range.commonAncestorContainer.parentElement;
+  for (let i = 0; i < 24 && el; i++, el = el.parentElement) {
+    const wm = getComputedStyle(el).writingMode;
+    if (
+      wm === 'vertical-rl' ||
+      wm === 'vertical-lr' ||
+      wm === 'sideways-rl' ||
+      wm === 'sideways-lr'
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const HIGHLIGHT_NAME = 'dict-scan';
+
+export function applyWordHighlight(range: Range): void {
+  clearWordHighlight();
+  if (typeof CSS === 'undefined' || !('highlights' in CSS)) return;
+  try {
+    (CSS as unknown as { highlights: { set: (n: string, h: unknown) => void } }).highlights.set(
+      HIGHLIGHT_NAME,
+      new (window as unknown as { Highlight: new (r: Range) => unknown }).Highlight(range)
+    );
+  } catch {
+    // unsupported
+  }
+}
+
+export function clearWordHighlight(): void {
+  if (typeof CSS === 'undefined' || !('highlights' in CSS)) return;
+  try {
+    (CSS as unknown as { highlights: { delete: (n: string) => void } }).highlights.delete(
+      HIGHLIGHT_NAME
+    );
+  } catch {
+    // ignore
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+
+function utfLenHits(hits: CharHit[]): number {
+  let n = 0;
+  for (const h of hits) n += h.units;
+  return n;
+}
+
+function readUnits(val: string, start: number, units: number): string {
+  return val.slice(start, start + units);
+}
+
+/** Characters strictly BEFORE caret offset */
+function collectBackwardHits(startNode: Text, caretUtf16: number, maxUtf16: number): CharHit[] {
+  const hitsRev: CharHit[] = [];
+  let spent = 0;
+  let cur: Node | null = startNode;
+  let idx = caretUtf16;
+
+  outer: while (cur && spent < maxUtf16) {
+    if (cur.nodeType !== Node.TEXT_NODE) {
+      cur = prevDomNode(cur);
+      continue;
+    }
+
+    const tn = cur as Text;
+    const val = tn.nodeValue ?? '';
+    let i = idx - 1;
+
+    while (i >= 0 && spent < maxUtf16) {
+      const lead = utf16LeadingIndexBackward(val, i);
+      const cp = val.codePointAt(lead)!;
+      const units = cp > 0xffff ? 2 : 1;
+      const start = lead;
+      const ch = String.fromCodePoint(cp);
+      if (ch === '\n' || ch === '\r') break outer;
+
+      hitsRev.push({ node: tn, startUtf16: start, units });
+      spent += units;
+      i = start - 1;
+    }
+
+    idx = Number.MAX_SAFE_INTEGER;
+    cur = prevDomNode(cur);
+    if (cur?.nodeType === Node.TEXT_NODE) idx = (cur as Text).length;
+  }
+
+  return hitsRev.reverse();
+}
+
+/** Characters AT caret offset and forward */
+function collectForwardHits(startNode: Text, caretUtf16: number, maxUtf16: number): CharHit[] {
+  const hits: CharHit[] = [];
+  let spent = 0;
+  let cur: Node | null = startNode;
+  let idx = caretUtf16;
+
+  outer: while (cur && spent < maxUtf16) {
+    if (cur.nodeType !== Node.TEXT_NODE) {
+      if (
+        cur.nodeType === Node.ELEMENT_NODE &&
+        BLOCK_TAGS.has((cur as Element).tagName.toUpperCase()) &&
+        hits.length
+      ) {
+        break outer;
+      }
+      cur = nextDomNode(cur);
+      idx = 0;
+      continue;
+    }
+
+    const tn = cur as Text;
+    const val = tn.nodeValue ?? '';
+    let i = idx;
+
+    while (i < val.length && spent < maxUtf16) {
+      const cp = val.codePointAt(i)!;
+      const units = cp > 0xffff ? 2 : 1;
+      const ch = String.fromCodePoint(cp);
+
+      if (ch === '\n' || ch === '\r') break outer;
+
+      hits.push({ node: tn, startUtf16: i, units });
+      spent += units;
+      i += units;
+    }
+
+    idx = 0;
+    cur = nextDomNode(cur);
+  }
+
+  return hits;
+}
+
+function utf16LeadingIndexBackward(val: string, fromInclusive: number): number {
+  const i = fromInclusive;
+  const c = val.charCodeAt(i);
+  if (c >= 0xdc00 && c <= 0xdfff && i > 0) {
+    const lead = val.charCodeAt(i - 1);
+    if (lead >= 0xd800 && lead <= 0xdbff) return i - 1;
+  }
+  return i;
+}
+
+function clipWordSegmentUtf16(
+  combined: string,
+  caretUtf16: number
+): { start: number; end: number } | null {
+  const caret = Math.min(Math.max(0, caretUtf16), combined.length);
+
+  const beforeCh = caret > 0 ? sliceBefore(combined, caret) : '';
+  const atCh = caret < combined.length ? sliceAt(combined, caret) : '';
+
+  if (
+    caret < combined.length &&
+    atCh &&
+    isDelimiter(atCh) &&
+    (!beforeCh || isDelimiter(beforeCh))
+  ) {
+    return null;
+  }
+
+  let lo = caret;
+  while (lo > 0) {
+    const prevStart = prevUtf16CharStart(combined, lo);
+    const ch = combined.slice(prevStart, lo);
+    if (isDelimiter(ch)) break;
+    lo = prevStart;
+  }
+
+  let hi = caret;
+  while (hi < combined.length) {
+    const ch = sliceAt(combined, hi);
+    if (!ch || isDelimiter(ch)) break;
+    hi += utf16LenChar(combined, hi);
+  }
+
+  return { start: lo, end: hi };
+}
+
+function boundaryTable(hits: CharHit[]): Array<{ node: Text; offset: number }> | null {
+  if (!hits.length) return null;
+  const boundaries: Array<{ node: Text; offset: number }> = [];
+  let cum = 0;
+  for (const h of hits) {
+    boundaries[cum] = { node: h.node, offset: h.startUtf16 };
+    cum += h.units;
+  }
+  const last = hits[hits.length - 1];
+  boundaries[cum] = { node: last.node, offset: last.startUtf16 + last.units };
+  return boundaries;
+}
+
+function utf16SliceToDomRange(hits: CharHit[], lo: number, hi: number): Range | null {
+  try {
+    const boundaries = boundaryTable(hits);
+    if (!boundaries) return null;
+    const startAnchor = boundaries[lo];
+    const endAnchor = boundaries[hi];
+    if (!startAnchor || !endAnchor) return null;
+    const r = document.createRange();
+    r.setStart(startAnchor.node, startAnchor.offset);
+    r.setEnd(endAnchor.node, endAnchor.offset);
+    return r;
+  } catch {
+    return null;
+  }
+}
+
+function isDelimiter(ch: string): boolean {
+  return ch.length > 0 && WORD_BOUNDARY_TEST.test(ch);
+}
+
+function sliceAt(s: string, utf16: number): string {
+  if (utf16 >= s.length) return '';
+  const cp = s.codePointAt(utf16)!;
+  return String.fromCodePoint(cp);
+}
+
+function utf16LenChar(s: string, utf16: number): number {
+  const cp = s.codePointAt(utf16)!;
+  return cp > 0xffff ? 2 : 1;
+}
+
+function sliceBefore(s: string, endExclusive: number): string {
+  if (endExclusive <= 0) return '';
+  const start = prevUtf16CharStart(s, endExclusive);
+  return s.slice(start, endExclusive);
+}
+
+function prevUtf16CharStart(s: string, endExclusive: number): number {
+  const i = endExclusive - 1;
+  const c = s.charCodeAt(i);
+  if (c >= 0xdc00 && c <= 0xdfff && i > 0) {
+    const lead = s.charCodeAt(i - 1);
+    if (lead >= 0xd800 && lead <= 0xdbff) return i - 1;
+  }
+  return i;
+}
 
 function getCaretRange(x: number, y: number): Range | null {
   if (typeof document.caretRangeFromPoint === 'function') {
@@ -98,17 +373,13 @@ function getCaretRange(x: number, y: number): Range | null {
   return null;
 }
 
-/**
- * When caret APIs miss (some layouts / overlays / browsers), approximate a caret
- * position from elementFromPoint + text-node geometry.
- */
 function fallbackCaretRangeFromPoint(x: number, y: number): Range | null {
   const raw = document.elementFromPoint(x, y);
   if (!raw) return null;
 
   let el: Element | null =
     raw.nodeType === Node.ELEMENT_NODE ? (raw as Element) : raw.parentElement;
-  while (el && el.nodeType === Node.ELEMENT_NODE && shouldRejectSubtree(el)) {
+  while (el && shouldRejectSubtree(el)) {
     el = el.parentElement;
   }
   if (!el) return null;
@@ -135,7 +406,9 @@ function findTextOffsetUnderElement(
 ): { node: Text; offset: number } | null {
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
   let node: Node | null;
-  let best: { node: Text; offset: number; dist: number } | null = null;
+
+  let bestContained: { node: Text; offset: number; dist: number } | null = null;
+  let bestDist: { node: Text; offset: number; dist: number } | null = null;
   let charBudget = 800;
 
   while ((node = walker.nextNode()) && charBudget > 0) {
@@ -152,22 +425,28 @@ function findTextOffsetUnderElement(
       range.setEnd(t, i + 1);
       const rect = range.getBoundingClientRect();
       if (rect.width === 0 && rect.height === 0) continue;
+
       const cx = rect.left + rect.width / 2;
       const cy = rect.top + rect.height / 2;
       const d = (cx - x) ** 2 + (cy - y) ** 2;
-      if (!best || d < best.dist) {
-        best = { node: t, offset: i, dist: d };
+
+      const inside =
+        x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom && rect.width > 0;
+
+      if (inside) {
+        if (!bestContained || d < bestContained.dist) {
+          bestContained = { node: t, offset: i, dist: d };
+        }
+      } else if (!bestContained && (!bestDist || d < bestDist.dist)) {
+        bestDist = { node: t, offset: i, dist: d };
       }
     }
   }
 
-  return best ? { node: best.node, offset: best.offset } : null;
+  const pick = bestContained ?? bestDist;
+  return pick ? { node: pick.node, offset: pick.offset } : null;
 }
 
-/**
- * Resolve the text node at the caret position, handling ruby elements and
- * element containers (caretRangeFromPoint sometimes returns an element node).
- */
 function resolveTextNode(range: Range): Node | null {
   const node: Node | null = range.startContainer;
 
@@ -193,58 +472,6 @@ function resolveTextNode(range: Range): Node | null {
   return null;
 }
 
-interface CollectResult {
-  text: string;
-  endNode: Node;
-  endOffset: number;
-}
-
-function collectForward(startNode: Node, startOffset: number, maxLength: number): CollectResult {
-  let text = '';
-  let endNode: Node = startNode;
-  let endOffset = startOffset;
-
-  let currentNode: Node | null = startNode;
-  let charOffset = startOffset;
-
-  while (currentNode && text.length < maxLength) {
-    if (currentNode.nodeType === Node.TEXT_NODE) {
-      const content = currentNode.nodeValue ?? '';
-      for (let i = charOffset; i < content.length && text.length < maxLength; i++) {
-        const ch = content[i];
-        const cp = content.codePointAt(i) ?? 0;
-
-        if (ch === '\n' || ch === '\r') {
-          if (text.length > 0) {
-            endNode = currentNode;
-            endOffset = i;
-            return { text, endNode, endOffset };
-          }
-          break;
-        }
-
-        if (cp === 0x200b || cp === 0x00ad || cp < 0x20) continue;
-
-        text += ch;
-        endNode = currentNode;
-        endOffset = i + 1;
-
-        if (cp > 0xffff) i++;
-      }
-      charOffset = 0;
-    } else if (currentNode.nodeType === Node.ELEMENT_NODE) {
-      const el = currentNode as Element;
-      if (text.length > 0 && BLOCK_TAGS.has(el.tagName.toUpperCase())) {
-        return { text, endNode, endOffset };
-      }
-    }
-
-    currentNode = nextDomNode(currentNode);
-  }
-
-  return { text, endNode, endOffset };
-}
-
 function nextDomNode(node: Node): Node | null {
   if (
     node.nodeType === Node.ELEMENT_NODE &&
@@ -262,6 +489,23 @@ function nextDomNode(node: Node): Node | null {
     current = current.parentNode;
   }
   return null;
+}
+
+function prevDomNode(node: Node): Node | null {
+  const prevSibling = node.previousSibling;
+  if (prevSibling) {
+    let cur: Node | null = prevSibling;
+    while (cur?.lastChild) {
+      const last = cur.lastChild;
+      if (last.nodeType === Node.ELEMENT_NODE && shouldRejectSubtree(last as Element)) break;
+      cur = last;
+    }
+    return cur;
+  }
+
+  const parent = node.parentNode;
+  if (!parent || parent === document.documentElement) return null;
+  return parent;
 }
 
 function shouldRejectSubtree(el: Element): boolean {
@@ -284,31 +528,4 @@ function firstTextDescendant(node: Node): Node | null {
     if (found) return found;
   }
   return null;
-}
-
-const HIGHLIGHT_NAME = 'dict-scan';
-
-/** Optional CSS Custom Highlight API (Chrome/Safari); harmless elsewhere */
-export function applyWordHighlight(range: Range): void {
-  clearWordHighlight();
-  if (typeof CSS === 'undefined' || !('highlights' in CSS)) return;
-  try {
-    (CSS as unknown as { highlights: { set: (n: string, h: unknown) => void } }).highlights.set(
-      HIGHLIGHT_NAME,
-      new (window as unknown as { Highlight: new (r: Range) => unknown }).Highlight(range)
-    );
-  } catch {
-    // unsupported
-  }
-}
-
-export function clearWordHighlight(): void {
-  if (typeof CSS === 'undefined' || !('highlights' in CSS)) return;
-  try {
-    (CSS as unknown as { highlights: { delete: (n: string) => void } }).highlights.delete(
-      HIGHLIGHT_NAME
-    );
-  } catch {
-    // ignore
-  }
 }
