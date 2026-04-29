@@ -43,7 +43,14 @@ const BLOCK_TAGS = new Set([
   'FIGCAPTION'
 ]);
 
-const WORD_BOUNDARY_TEST = /[^\w\p{L}\p{N}]/u;
+/** Unicode-property regex may fail on older engines — fallback below */
+let delimiterRegex: RegExp;
+try {
+  delimiterRegex = /[^\w\p{L}\p{N}]/u;
+  delimiterRegex.test('あ');
+} catch {
+  delimiterRegex = /(?:\s|[\u3000-\u303f]|[!"#$%&'()*+,./:;<=>?^_`{|}~-]|〜)/;
+}
 
 export interface ScanResult {
   text: string;
@@ -84,7 +91,9 @@ export function scanTextAtPoint(x: number, y: number, maxSpanUtf16 = 64): ScanRe
     .join('');
   const caretCombinedUtf16 = utfLenHits(leftHits);
 
-  const slice = clipWordSegmentUtf16(combined, caretCombinedUtf16);
+  const slice =
+    clipWordWithIntlSegmenter(combined, caretCombinedUtf16) ??
+    clipWordSegmentUtf16(combined, caretCombinedUtf16);
   if (!slice || slice.end <= slice.start) return null;
 
   const range = utf16SliceToDomRange(hits, slice.start, slice.end);
@@ -295,22 +304,65 @@ function clipWordSegmentUtf16(
   return { start: lo, end: hi };
 }
 
-function boundaryTable(hits: CharHit[]): Array<{ node: Text; offset: number }> | null {
+/**
+ * One entry per UTF-16 index into `combined`, plus terminal end offset.
+ * Fixes sparse-boundary bugs with surrogate pairs (previous impl broke boundaries[n]).
+ */
+function buildDenseBoundaries(hits: CharHit[]): Array<{ node: Text; offset: number }> | null {
   if (!hits.length) return null;
-  const boundaries: Array<{ node: Text; offset: number }> = [];
+  const total = utfLenHits(hits);
+  const dense: Array<{ node: Text; offset: number }> = new Array(total + 1);
   let cum = 0;
   for (const h of hits) {
-    boundaries[cum] = { node: h.node, offset: h.startUtf16 };
+    for (let u = 0; u < h.units; u++) {
+      dense[cum + u] = { node: h.node, offset: h.startUtf16 + u };
+    }
     cum += h.units;
   }
   const last = hits[hits.length - 1];
-  boundaries[cum] = { node: last.node, offset: last.startUtf16 + last.units };
-  return boundaries;
+  dense[cum] = { node: last.node, offset: last.startUtf16 + last.units };
+  return dense;
+}
+
+/** Prefer native word segmentation when available (Chrome 102+, Safari 16.4+, Firefox 125+). */
+function clipWordWithIntlSegmenter(
+  combined: string,
+  caretUtf16: number
+): { start: number; end: number } | null {
+  try {
+    const SegmenterCtor = (
+      Intl as typeof Intl & {
+        Segmenter?: new (
+          locales: string | string[],
+          options?: { granularity?: string }
+        ) => {
+          segment: (
+            input: string
+          ) => Iterable<{ segment: string; index: number; isWordLike?: boolean }>;
+        };
+      }
+    ).Segmenter;
+    if (typeof SegmenterCtor !== 'function') return null;
+
+    const caret = Math.min(Math.max(0, caretUtf16), combined.length);
+    const segmenter = new SegmenterCtor('ja', { granularity: 'word' });
+
+    for (const seg of segmenter.segment(combined)) {
+      const start = seg.index;
+      const end = start + seg.segment.length;
+      if (caret >= start && caret < end) {
+        return { start, end };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function utf16SliceToDomRange(hits: CharHit[], lo: number, hi: number): Range | null {
   try {
-    const boundaries = boundaryTable(hits);
+    const boundaries = buildDenseBoundaries(hits);
     if (!boundaries) return null;
     const startAnchor = boundaries[lo];
     const endAnchor = boundaries[hi];
@@ -325,7 +377,7 @@ function utf16SliceToDomRange(hits: CharHit[], lo: number, hi: number): Range | 
 }
 
 function isDelimiter(ch: string): boolean {
-  return ch.length > 0 && WORD_BOUNDARY_TEST.test(ch);
+  return ch.length > 0 && delimiterRegex.test(ch);
 }
 
 function sliceAt(s: string, utf16: number): string {
